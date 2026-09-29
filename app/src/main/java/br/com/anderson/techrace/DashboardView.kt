@@ -78,8 +78,9 @@ class DashboardView(context: Context) : View(context) {
         lambdaMv = data.lambdaMv
         hasData = true
         temperatureC = TechRaceDecoder.temperatureC(data.temperatureRaw)
-        // RAM 49 is Y_PERCENT, not EEPROM SETUP_FLAGS nor measured ethanol.
-        mixturePercent = data.raw6.takeIf { it in 0..100 }
+        // RAM 49 is Y_PERCENT: show the raw internal index even when it is not
+        // a display percentage. Hiding values above 100 made the card look stuck.
+        mixturePercent = data.raw6
         communicationOk = true
 
         if (rpm > 100) {
@@ -220,7 +221,7 @@ class DashboardView(context: Context) : View(context) {
         compactCard(c, 1023f, 160f, 245f, 210f, "INJEÇÃO", if (injectionMs > 0) format(injectionMs, 2) else "--", "ms", "PW", green)
         compactCard(c, 1279f, 160f, 245f, 210f, "CORREÇÃO", if (hasData) signed(correction, 1) else "--", "%", "Acréscimo final", orange)
         compactCard(c, 1023f, 385f, 245f, 210f, "TEMP. MOTOR", temperatureC?.toString() ?: "--", "°C", "ECT", red)
-        compactCard(c, 1279f, 385f, 245f, 210f, "MISTURA", mixturePercent?.toString() ?: "--", "%", "Índice interno", yellow)
+        compactCard(c, 1279f, 385f, 245f, 210f, "MISTURA", mixtureValue(), mixtureUnit(), "Índice interno", yellow)
 
         drawMainGraphLandscape(c)
         drawStatusesLandscape(c)
@@ -441,7 +442,15 @@ class DashboardView(context: Context) : View(context) {
         card(c,12f,y,w,h,"INJEÇÃO",if(injectionMs>0) format(injectionMs,2) else "--","ms","PW",green,"▰")
         card(c,12f+w+gap,y,w,h,"CORREÇÃO",if(hasData) signed(correction,1) else "--","%","Acréscimo final",orange,"◴")
         card(c,12f+(w+gap)*2,y,w,h,"TEMP. MOTOR",temperatureC?.toString() ?: "--","°C","ECT",red,"♨")
-        card(c,12f+(w+gap)*3,y,w,h,"MISTURA",mixturePercent?.toString() ?: "--","%","Índice interno",yellow,"⛽")
+        card(c,12f+(w+gap)*3,y,w,h,"MISTURA",mixtureValue(),mixtureUnit(),"Índice interno",yellow,"⛽")
+    }
+
+    private fun mixtureValue(): String = mixturePercent?.toString() ?: "--"
+
+    private fun mixtureUnit(): String = when (val value = mixturePercent) {
+        null -> "%"
+        in 0..100 -> "%"
+        else -> "raw"
     }
 
     private fun card(c:Canvas,x:Float,y:Float,w:Float,h:Float,title:String,value:String,unit:String,subtitle:String,color:Int,icon:String) {

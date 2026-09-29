@@ -26,6 +26,16 @@ import kotlin.math.PI
 import kotlin.math.sin
 
 class MainActivity : Activity() {
+    companion object {
+        private const val DRAIN_IDLE_READ_MS = 40
+        private const val DRAIN_TIMEOUT_MS = 350L
+        private const val SERIAL_READ_MS = 60
+        private const val LIVE_RESPONSE_TIMEOUT_MS = 1400L
+        private const val QUERY_RESPONSE_TIMEOUT_MS = 1400L
+        private const val WRITE_RESPONSE_TIMEOUT_MS = 1200L
+        private const val MAX_LIVE_FAILURES_BEFORE_PAUSE = 3
+    }
+
     private enum class ProgrammingMode(val selector: Int, val flagMask: Int, val label: String) {
         SONDA_RPM(1, 0x02, "Sonda / RPM"),
         MAP(2, 0x01, "Sensor MAP")
@@ -65,6 +75,8 @@ class MainActivity : Activity() {
     private var programmingStatusView: TextView? = null
     private var programmingStartedAt = 0L
     private var resumePollingAfterProgramming = false
+    private var liveFailureStreak = 0
+    private var mapSecondStageAcknowledged = false
     private val programmingStatusTask = Runnable {
         programmingMode?.let { queryProgrammingStatus(it) }
     }
@@ -185,6 +197,8 @@ class MainActivity : Activity() {
         handler.removeCallbacks(programmingStatusTask)
         programmingMode = null
         resumePollingAfterProgramming = false
+        liveFailureStreak = 0
+        mapSecondStageAcknowledged = false
         programmingStatusView = null
         programmingDialog?.dismiss()
         programmingDialog = null
@@ -276,11 +290,11 @@ class MainActivity : Activity() {
         val instructions = if (mode == ProgrammingMode.SONDA_RPM) {
             "O comando original inicia a rotina Sonda/RPM. Mantenha o motor em condição estável e use a tela de status para acompanhar a flag 0x02 da EEPROM."
         } else {
-            "O comando original inicia a rotina do sensor MAP. Mantenha o motor em condição estável e use a tela de status para acompanhar a flag 0x01 da EEPROM."
+            "O comando original inicia a rotina do sensor MAP. Faça a primeira etapa em marcha lenta estável. Depois use a segunda etapa com ar-condicionado ligado ou câmbio automático em Drive, conforme o procedimento observado no módulo."
         }
         AlertDialog.Builder(this)
             .setTitle("Iniciar ${mode.label}?")
-            .setMessage("$instructions\n\nA telemetria contínua será pausada durante a programação. A sequência visual do antigo FlexProgram.cpp não foi fornecida, portanto o APK não inventa etapas adicionais.")
+            .setMessage("$instructions\n\nA telemetria contínua será pausada durante a programação. O APK envia o seletor confirmado pelo Program.cpp e guia as condições operacionais observadas no teste real.")
             .setPositiveButton("Iniciar programação") { _, _ -> sendProgrammingStart(mode) }
             .setNegativeButton("Cancelar", null).show()
     }
@@ -321,7 +335,13 @@ class MainActivity : Activity() {
                     resumePollingAfterProgramming = false
                 } else {
                     programmingMode = mode
+                    mapSecondStageAcknowledged = false
                     programmingStartedAt = SystemClock.elapsedRealtime()
+                    if (mode == ProgrammingMode.MAP) {
+                        dashboard.updateProgrammingFlags(map = true, sondaRpm = dashboard.sondaProgrammed)
+                    } else {
+                        dashboard.updateProgrammingFlags(map = dashboard.mapProgrammed, sondaRpm = true)
+                    }
                     showProgrammingProgress(mode, tx, rx)
                     handler.postDelayed(programmingStatusTask, 700L)
                 }
@@ -338,6 +358,9 @@ class MainActivity : Activity() {
                 append("Rotina: ${mode.label}\n")
                 append("TX: ${TechRaceProtocol.toHex(tx)}\n")
                 append("RX: ${TechRaceProtocol.toHex(rx)}\n\n")
+                if (mode == ProgrammingMode.MAP) {
+                    append("Etapa 1/2: marcha lenta estável. Quando estabilizar, toque em 'Etapa 2 pronta' e ligue o ar-condicionado ou coloque em Drive se for automático.\n\n")
+                }
                 append("Aguardando leitura da EEPROM para acompanhar o status...")
             }
             setTextIsSelectable(true)
@@ -348,6 +371,7 @@ class MainActivity : Activity() {
             .setView(ScrollView(this).apply { addView(status) })
             .setPositiveButton("Finalizar / encerrar", null)
             .setNeutralButton("Consultar agora", null)
+            .setNegativeButton(if (mode == ProgrammingMode.MAP) "Etapa 2 pronta" else "Orientação", null)
             .setCancelable(false)
             .create()
         programmingDialog = dialog
@@ -358,8 +382,30 @@ class MainActivity : Activity() {
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
                 if (busy) toast("Consulta em andamento") else programmingMode?.let { queryProgrammingStatus(it) }
             }
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                if (mode == ProgrammingMode.MAP) markMapSecondStageReady()
+                else toast("Mantenha motor e sonda em condição estável até a flag da EEPROM confirmar.")
+            }
         }
         dialog.show()
+    }
+
+    private fun markMapSecondStageReady() {
+        if (programmingMode != ProgrammingMode.MAP) return
+        mapSecondStageAcknowledged = true
+        val elapsed = (SystemClock.elapsedRealtime() - programmingStartedAt) / 1000
+        programmingStatusView?.text = """
+            Rotina: Sensor MAP
+            Tempo desde o comando: ${elapsed}s
+
+            Etapa 2/2 marcada no APK.
+            Condição esperada agora: ar-condicionado ligado ou câmbio automático em Drive.
+
+            O comando enviado ao módulo continua sendo o seletor MAP confirmado pelo Program.cpp; esta etapa orienta a condição mecânica que o FlexProgram original provavelmente solicitava na tela.
+
+            Aguardando próxima leitura da EEPROM/status...
+        """.trimIndent()
+        if (!busy) queryProgrammingStatus(ProgrammingMode.MAP)
     }
 
     private fun queryProgrammingStatus(mode: ProgrammingMode) {
@@ -389,6 +435,10 @@ class MainActivity : Activity() {
                 busy = false
                 if (err != null || data == null) {
                     programmingStatusView?.text = "Programação ${mode.label} iniciada, mas a consulta de status falhou: ${err ?: "resposta inválida"}.\n\nUse 'Consultar agora' para tentar novamente ou 'Finalizar / encerrar' para enviar o seletor 0."
+                    if ((SystemClock.elapsedRealtime() - programmingStartedAt) < 90_000) {
+                        handler.removeCallbacks(programmingStatusTask)
+                        handler.postDelayed(programmingStatusTask, 2000L)
+                    }
                     return@post
                 }
                 val settings = ModuleSettings(data)
@@ -406,6 +456,13 @@ class MainActivity : Activity() {
                         append("A central informa o bit associado a esta programação como ativo. Esse bit também pode refletir uma calibração anterior; o arquivo FlexProgram.cpp não foi fornecido para confirmar o critério exato de término.\n\n")
                     } else {
                         append("A rotina permanece em acompanhamento. Não desligue alimentação nem desconecte o USB enquanto estiver programando.\n\n")
+                    }
+                    if (mode == ProgrammingMode.MAP) {
+                        append("Etapa MAP no APK: ${if (mapSecondStageAcknowledged) "2/2 ar-condicionado/Drive" else "1/2 marcha lenta"}.\n")
+                        if (!mapSecondStageAcknowledged) {
+                            append("Quando a marcha lenta estabilizar, toque em 'Etapa 2 pronta'.\n")
+                        }
+                        append("\n")
                     }
                     append("Último RX EEPROM: ${TechRaceProtocol.toHex(rx)}")
                 }
@@ -485,18 +542,18 @@ class MainActivity : Activity() {
         val buffer = ByteArray(128)
         var last = byteArrayOf()
         repeat(attempts.coerceIn(1, 3)) {
-            val drainDeadline = SystemClock.elapsedRealtime() + 300
-            while (p.read(buffer, 30) > 0) {
+            val drainDeadline = SystemClock.elapsedRealtime() + DRAIN_TIMEOUT_MS
+            while (p.read(buffer, DRAIN_IDLE_READ_MS) > 0) {
                 if (!valid(token)) throw CancellationException()
                 check(SystemClock.elapsedRealtime() < drainDeadline) { "USB sem intervalo ocioso" }
             }
             if (!valid(token)) throw CancellationException()
             p.write(tx, 500)
             val out = ByteArrayOutputStream()
-            val deadline = SystemClock.elapsedRealtime() + 900
+            val deadline = SystemClock.elapsedRealtime() + WRITE_RESPONSE_TIMEOUT_MS
             while (SystemClock.elapsedRealtime() < deadline) {
                 if (!valid(token)) throw CancellationException()
-                val n = p.read(buffer, 40)
+                val n = p.read(buffer, SERIAL_READ_MS)
                 if (n > 0) {
                     out.write(buffer, 0, n)
                     if (out.size() > 128) break
@@ -701,17 +758,17 @@ class MainActivity : Activity() {
                 val p = port ?: error("Porta fechada")
                 val buffer = ByteArray(128)
                 // Drain stale bytes to an idle gap before the next request, bounded in time.
-                val drainDeadline = SystemClock.elapsedRealtime() + 300
-                while (p.read(buffer, 30) > 0) {
+                val drainDeadline = SystemClock.elapsedRealtime() + DRAIN_TIMEOUT_MS
+                while (p.read(buffer, DRAIN_IDLE_READ_MS) > 0) {
                     if (!valid(token)) throw CancellationException()
                     check(SystemClock.elapsedRealtime() < drainDeadline) { "USB sem intervalo ocioso" }
                 }
                 if (!valid(token)) throw CancellationException()
                 p.write(TechRaceProtocol.READ_LIVE_10, 500)
-                val deadline = SystemClock.elapsedRealtime() + 800
+                val deadline = SystemClock.elapsedRealtime() + LIVE_RESPONSE_TIMEOUT_MS
                 while (SystemClock.elapsedRealtime() < deadline) {
                     if (!valid(token)) throw CancellationException()
-                    val n = p.read(buffer, 40)
+                    val n = p.read(buffer, SERIAL_READ_MS)
                     if (n > 0) {
                         response.append(buffer.copyOf(n))
                         if (response.snapshot().size > 13) break
@@ -733,6 +790,7 @@ class MainActivity : Activity() {
                     lastRx = response.snapshot()
                     val payload = response.payload()
                     if (failure == null && payload != null) {
+                        liveFailureStreak = 0
                         val data = TechRaceDecoder.decode(payload, rpmCalibration)
                         lastData = data
                         dashboard.updateData(data)
@@ -743,9 +801,12 @@ class MainActivity : Activity() {
                     } else {
                         lastError = failure ?: "Resposta inválida"
                         dashboard.markCommunicationFailure()
-                        polling = false // stop on error, like the desktop
-                        dashboard.autoReading = false
-                        toast("Leitura parada: $lastError")
+                        liveFailureStreak++
+                        if (liveFailureStreak >= MAX_LIVE_FAILURES_BEFORE_PAUSE) {
+                            polling = false
+                            dashboard.autoReading = false
+                            toast("Leitura pausada após $liveFailureStreak falhas: $lastError")
+                        }
                     }
                     if (polling) handler.postDelayed(pollTask, pollingIntervalMs)
                 }
@@ -836,17 +897,17 @@ class MainActivity : Activity() {
             try {
                 val p = port ?: error("Porta fechada")
                 val buf = ByteArray(128)
-                val drainDeadline = SystemClock.elapsedRealtime() + 300
-                while (p.read(buf, 30) > 0) {
+                val drainDeadline = SystemClock.elapsedRealtime() + DRAIN_TIMEOUT_MS
+                while (p.read(buf, DRAIN_IDLE_READ_MS) > 0) {
                     if (!valid(token)) throw CancellationException()
                     check(SystemClock.elapsedRealtime() < drainDeadline) { "USB sem intervalo ocioso" }
                 }
                 if (!valid(token)) throw CancellationException()
                 p.write(tx, 500)
-                val deadline = SystemClock.elapsedRealtime() + 800
+                val deadline = SystemClock.elapsedRealtime() + QUERY_RESPONSE_TIMEOUT_MS
                 while (SystemClock.elapsedRealtime() < deadline) {
                     if (!valid(token)) throw CancellationException()
-                    val n = p.read(buf, 40)
+                    val n = p.read(buf, SERIAL_READ_MS)
                     if (n > 0) {
                         received.append(buf.copyOf(n))
                         if (received.snapshot().size > expected + 3) break
@@ -866,10 +927,9 @@ class MainActivity : Activity() {
                     moduleReport = "Falha na consulta: $failure\n$wire"
                     if (kind == 0) firmwareVersion = "Consulta falhou"
                     if (kind == 1) settingsSnapshot = null
-                    polling = false
-                    dashboard.autoReading = false
                     dashboard.markCommunicationFailure()
-                    toast("Consulta falhou; veja Diagnóstico. Leitura contínua pausada.")
+                    toast("Consulta falhou; veja Diagnóstico.")
+                    if (polling) handler.postDelayed(pollTask, pollingIntervalMs)
                 } else {
                     when (kind) {
                         0 -> {
